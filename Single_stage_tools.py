@@ -63,36 +63,48 @@ class SingleStageWeaklySupervisedModel(nn.Module):
 
         # Classification forward pass
         logits_cls = self.classification_head(features)  # (B, num_classes)
+         # Generate pseudo masks using CAM 
+        classifier_weights = self.classification_head.weight  
+        pseudo_masks = generate_cam(features, logits_cls, classifier_weights)
 
         # Segmentation forward pass
         logits_seg = self.segmentation_head(features)    # (B, num_classes, H, W) or (B, 1, H, W)
 
-        if self.training:
-            # Compute classification loss if labels are available
-            loss_cls = torch.tensor(0.0, device=images.device)
-            if labels is not None:
-                loss_cls = F.cross_entropy(logits_cls, labels)
-
-            # Compute segmentation loss if masks are available
-            loss_seg = torch.tensor(0.0, device=images.device)
-            if masks is not None:
-                # If the segmentation head outputs multiple classes, 
-                # you might use cross-entropy or dice-based losses, etc.
-                # If it’s a single foreground/background, maybe BCEWithLogitsLoss.
-                loss_seg = F.cross_entropy(logits_seg, masks.squeeze(1))  # example usage
-
-            total_loss = self.lambda_cls * loss_cls + self.lambda_seg * loss_seg
-
-            return { "loss_cls": loss_cls, "loss_seg": loss_seg, "loss_total": total_loss}
-        else:
-            # In eval mode, we usually just return the model predictions
-            # for classification or segmentation
-            return { "logits_cls": logits_cls, "logits_seg": logits_seg}
+        return { "logits_cls": logits_cls, "logits_seg": logits_seg, "pseudo_masks": pseudo_masks}
         
 
-def train_single_stage_model(model, train_loader, val_loader=None, classification_loss_fn=None, 
-                             segmentation_loss_fn=None, lambda_cls=1.0, lambda_seg=1.0, optimizer=None, 
-                             device="cuda", num_epochs=10, print_every=1):
+def generate_cam(features, logits_cls, classifier_weights):
+    """
+    Generate Class Activation Maps (CAMs) from features and classifier weights.
+
+    Args:
+        features (Tensor): Feature maps before GAP, shape (B, C, H, W)
+        logits_cls (Tensor): Logits from the classification head, shape (B, num_classes)
+        classifier_weights (Tensor): Weights of the fully connected classification layer, shape (num_classes, C)
+    
+    Returns:
+        Tensor: CAMs of shape (B, num_classes, H, W)
+    """
+    # Ensure classifier_weights has shape (num_classes, C)
+    assert classifier_weights.shape[1] == features.shape[1], "Classifier weights and feature channels mismatch"
+
+    # Compute A_k = w_k^T f(x) 
+    Ak = torch.einsum("bcHW,kc->bkHW", features, classifier_weights)  # Einstein sum performs the dot product
+
+    # Apply ReLU
+    Ak = F.relu(Ak)
+
+    # Normalize by maximum value per class per image
+    Ak_max = Ak.view(Ak.shape[0], Ak.shape[1], -1).max(dim=2, keepdim=True)[0]  # (B, num_classes, 1)
+    cam = Ak / (Ak_max + 1e-8)  # Avoid division by zero
+
+    return cam
+
+
+
+def train_single_stage_model(model, train_loader, val_loader = None, classification_loss_fn = None, 
+                             segmentation_loss_fn = None, weightCls=1.0, weightSeg=1.0, optimizer = None, 
+                             device="cpu", num_epochs=10, print_every=1):
     """
     Trains a SingleStageWeaklySupervisedModel (or a similar multi-head model).
     
@@ -122,7 +134,7 @@ def train_single_stage_model(model, train_loader, val_loader=None, classificatio
 
     # Provide default losses if none given
     if classification_loss_fn is None:
-        classification_loss_fn = nn.CrossEntropyLoss()
+        classification_loss_fn = nn.BCEWithLogitsLoss()
     if segmentation_loss_fn is None:
         segmentation_loss_fn = nn.CrossEntropyLoss()
 
@@ -146,26 +158,20 @@ def train_single_stage_model(model, train_loader, val_loader=None, classificatio
 
             optimizer.zero_grad()
 
-            # Forward pass: in "train" mode, SingleStageWeaklySupervisedModel
-            # might return a dict with losses directly, or just the logits.
-            # For this example, let's assume it returns logits we can pass to our
-            # custom losses:
             outputs = model(images)
 
-            logits_cls = outputs["logits_cls"]  # shape: (B, num_classes)
-            logits_seg = outputs["logits_seg"]  # shape: (B, num_classes, H, W) or (B, 1, H, W)
+            logitsCls = outputs["logits_cls"]  # shape: (B, num_classes)
+            logitsSeg = outputs["logits_seg"]  # shape: (B, num_classes, H, W) or (B, 1, H, W)
+            pseudoMasks = outputs["pseudo_masks"]
 
             # Compute classification loss
-            loss_cls = classification_loss_fn(logits_cls, labels)
+            lossCls = classification_loss_fn(logitsCls, labels)
 
             # Compute segmentation loss
-            # If your masks are shape (B, 1, H, W) and your logits_seg are (B, num_classes, H, W),
-            # you may need to adjust them. Example for a single foreground class:
-            # masks = masks.squeeze(1)  # shape (B, H, W)
-            loss_seg = segmentation_loss_fn(logits_seg, masks)
+            lossSeg = segmentation_loss_fn(logitsSeg, pseudoMasks)
 
             # Combine losses
-            loss = lambda_cls * loss_cls + lambda_seg * loss_seg
+            loss = weightCls * lossCls + weightSeg * lossSeg
 
             # Backprop
             loss.backward()
@@ -173,8 +179,8 @@ def train_single_stage_model(model, train_loader, val_loader=None, classificatio
 
             # Accumulate statistics
             running_loss += loss.item()
-            running_cls_loss += loss_cls.item()
-            running_seg_loss += loss_seg.item()
+            running_cls_loss += lossCls.item()
+            running_seg_loss += lossSeg.item()
 
         # Print training progress
         if (epoch + 1) % print_every == 0:
@@ -228,3 +234,4 @@ def validate_single_stage_model( model, val_loader, classification_loss_fn, segm
 
     print(f"[Validation] Total Loss: {val_loss:.4f}, "
           f"Cls Loss: {val_cls_loss:.4f}, Seg Loss: {val_seg_loss:.4f}")
+    
