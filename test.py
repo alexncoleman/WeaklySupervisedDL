@@ -76,8 +76,8 @@ if __name__ == "__main__":
     
 
     # Create DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=0)
 
     # Test several segmentation heads
     results = single_stage.test_segmentation_heads(train_loader, val_loader, num_epochs=5, lr=1e-3, device=device)

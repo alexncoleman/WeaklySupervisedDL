@@ -9,6 +9,7 @@ from torchvision.datasets import OxfordIIITPet
 from torch.utils.data import DataLoader
 import numpy as np
 import torchvision.transforms.functional as TF
+from transformers import SegformerForSemanticSegmentation
 
 
 def mask_transform(target):
@@ -110,6 +111,7 @@ def generate_cam(features, logits_cls, classifier_weights):
         Tensor: CAMs of shape (B, num_classes, H, W)
     """
     # Ensure classifier_weights has shape (num_classes, C)
+    features = features[-1]
     assert classifier_weights.shape[1] == features.shape[1], "Classifier weights and feature channels mismatch"
 
     # Compute A_k = w_k^T f(x) 
@@ -172,6 +174,7 @@ def train_single_stage_model(model, train_loader, val_loader = None, classificat
         running_seg_loss = 0.0
 
         for batch_idx, (images, (labels, masks)) in enumerate(train_loader):
+            print(batch_idx)
             images = images.to(device)
             labels = labels.to(device)
             masks = masks.to(device)
@@ -554,7 +557,7 @@ class AlternativeSegmentationHead2(nn.Module):
         x = self.upsample(x)
         return x
 
-# Dummy implementations for backbone and classification head.
+# Simple implementations for backbone and classification head.
 class SimpleBackbone(nn.Module):
     def __init__(self):
         super(SimpleBackbone, self).__init__()
@@ -586,24 +589,170 @@ class SimpleClassificationHead(nn.Module):
         x = self.gap(x)
         x = x.view(x.size(0), -1)
         return self.fc(x)
+    
+
+class SegFormerDecoderHead(nn.Module):
+    def __init__(self, decoder, upsample_scale=4):
+        """
+        Wraps a SegFormer decoder and classifier as a segmentation head.
+        
+        Args:
+            decoder (nn.Module): The pretrained SegFormer decoder.
+            upsample_scale (int): Factor to upsample the output logits to match input resolution.
+        """
+        super(SegFormerDecoderHead, self).__init__()
+        self.decoder = decoder
+        self.upsample_scale = upsample_scale
+
+    def forward(self, features):
+        """
+        Args:
+            features (List[Tensor]): A list of feature maps from your backbone.
+                                      They should match the expected input of the decoder.
+        Returns:
+            Tensor: The upsampled per-pixel class logits.
+        """
+        # The decoder expects a list of features, for example [f1, f2, f3, f4]
+        logits = self.decoder(features)
+        # Upsample to the desired resolution (e.g., original image size)
+        logits = F.interpolate(logits, scale_factor=self.upsample_scale, mode='bilinear', align_corners=False)
+        return logits
+
+
+class SegFormerHead(nn.Module):
+    def __init__(self, in_channels_list=[16, 32, 64, 128], embed_dim=256, num_seg_classes=37, upsample_scale=8):
+        """
+        SegFormer-style segmentation head with multi-level feature fusion.
+
+        Args:
+            in_channels_list (list): List of input channel sizes from different backbone stages.
+            embed_dim (int): Dimensionality of the embedding.
+            num_seg_classes (int): Number of segmentation classes.
+            upsample_scale (int): Upsampling factor to match input resolution.
+        """
+        super(SegFormerHead, self).__init__()
+        
+        # 1x1 conv projections for each input feature map
+        self.projections = nn.ModuleList([
+            nn.Conv2d(in_ch, embed_dim, kernel_size=1) for in_ch in in_channels_list
+        ])
+        
+        # Fusion layer (simple sum or concat + Conv1x1)
+        self.fusion = nn.Conv2d(embed_dim * len(in_channels_list), embed_dim, kernel_size=1)
+        
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Conv2d(embed_dim, num_seg_classes, kernel_size=1)
+        self.upsample_scale = upsample_scale
+
+    def forward(self, features):
+        """
+        Args:
+            features (list of tensors): Feature maps from backbone [f1, f2, f3, f4]
+        
+        Returns:
+            Tensor: Per-pixel class logits (B, num_seg_classes, H, W)
+        """
+        # Apply individual projections
+        projected_features = [proj(f) for proj, f in zip(self.projections, features)]
+        
+        # Resize all features to match the highest resolution (f1)
+        target_size = projected_features[0].shape[2:]  # Get H, W of f1
+        projected_features = [F.interpolate(f, size=target_size, mode='bilinear', align_corners=False)
+                              for f in projected_features]
+
+        # Fuse all projected feature maps (concatenation + 1x1 conv)
+        fused_features = torch.cat(projected_features, dim=1)
+        fused_features = self.fusion(fused_features)  
+
+        # Classification
+        x = self.dropout(fused_features)
+        x = self.classifier(x)
+
+        # Upsample to match the original input resolution
+        #x = F.interpolate(x, scale_factor=self.upsample_scale, mode='bilinear', align_corners=False)
+        return x
+    
+# Segformer expects a list of features, hence we need to change backbone to provide this and the simple classifier to be
+# able to handle this
+class SegFormerBackbone(nn.Module):
+    def __init__(self):
+        super(SegFormerBackbone, self).__init__()
+        # Stage 1: Initial low-level features, full resolution.
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        # Stage 2: Downsample by 2.
+        self.stage2 = nn.Sequential(
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        # Stage 3: Downsample further by 2 (total factor 4).
+        self.stage3 = nn.Sequential(
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+
+    def forward(self, x):
+        # Each stage returns a feature map at a different resolution.
+        f1 = self.stage1(x)    # Resolution: H x W, channels: 16
+        f2 = self.stage2(f1)   # Resolution: H/2 x W/2, channels: 32
+        f3 = self.stage3(f2)   # Resolution: H/4 x W/4, channels: 64
+        return [f1, f2, f3]
+    
+class SimpleSegFormerClassificationHead(nn.Module):
+    def __init__(self, in_channels=64, num_classes=37):
+        super(SimpleSegFormerClassificationHead, self).__init__()
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(in_channels, num_classes)
+        # Expose weights for CAM generation
+        self.weight = self.fc.weight  
+    def forward(self, x):
+        # Use the classification head on the highest-resolution feature (example)
+        x = self.gap(x[-1])
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
 
 def test_segmentation_heads(train_loader, val_loader, num_epochs=5, lr=1e-4, device="cuda"):
     # Fixed backbone and classification head for these experiments
-    backbone = SimpleBackbone().to(device)
+    backbone = SegFormerBackbone().to(device)
     # Freeze the backbone parameters
     for param in backbone.parameters():
         param.requires_grad = False
     backbone.eval()
 
-    classification_head = SimpleClassificationHead(in_channels=64, num_classes=37).to(device)
+    classification_head = SimpleSegFormerClassificationHead(in_channels=64, num_classes=37).to(device)
     
     # Define the segmentation heads to test along with names for identification
-    segmentation_heads = [
-        ("SimpleSegmentationHead", SimpleSegmentationHead(in_channels=64, num_seg_classes=37)),
-        ("AlternativeSegmentationHead1", AlternativeSegmentationHead1(in_channels=64, num_seg_classes=37)),
-        ("AlternativeSegmentationHead2", AlternativeSegmentationHead2(in_channels=64, num_seg_classes=37))
-    ]
-    
+    # segmentation_heads = [
+    #     ("SimpleSegmentationHead", SimpleSegmentationHead(in_channels=64, num_seg_classes=37)),
+    #     ("AlternativeSegmentationHead1", AlternativeSegmentationHead1(in_channels=64, num_seg_classes=37)),
+    #     ("AlternativeSegmentationHead2", AlternativeSegmentationHead2(in_channels=64, num_seg_classes=37))
+    # ]
+
+    num_labels = 37
+    id2label = {str(i): f"class_{i}" for i in range(num_labels)}
+    label2id = {v: k for k, v in id2label.items()}
+
+    full_segformer = SegformerForSemanticSegmentation.from_pretrained(
+        "nvidia/mit-b2",
+        num_labels=num_labels,
+        id2label=id2label,
+        label2id=label2id
+    )
+
+    # Extract the decoder and classifier.
+    # In Hugging Face's implementation, these are typically stored as attributes:
+    # pretrained_decoder = full_segformer.decode_head
+
+    segmentation_heads = [("SegformerDecoderHead", SegFormerHead([16, 32, 64], embed_dim = 64))]
     
     results = {}
     
@@ -655,7 +804,7 @@ def test_segmentation_heads(train_loader, val_loader, num_epochs=5, lr=1e-4, dev
             "seg_accuracy": seg_acc,
             "seg_f1": seg_f1
         }
-        print(f"Segmentation Head {head_name}: Pixel Accuracy = {seg_acc*100:.2f}%, Weighted F1 = {seg_f1:.4f}, mIoU: {mean_iou:.4f}")
+        print(f"Segmentation Head {head_name}: Pixel Accuracy = {seg_acc*100:.2f}%, Weighted F1 = {seg_f1:.4f}, mIoU: {seg_mIoU:.4f}")
     
     # Print summary for all segmentation heads
     print("\n--- Summary of Segmentation Heads ---")
