@@ -76,7 +76,7 @@ if __name__ == "__main__":
     
 
     # Create DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=0)
 
     # Test several segmentation heads
