@@ -174,7 +174,7 @@ def train_single_stage_model(model, train_loader, val_loader = None, classificat
         running_seg_loss = 0.0
 
         for batch_idx, (images, (labels, masks)) in enumerate(train_loader):
-            print(batch_idx)
+            print("Batch:", batch_idx,"/",len(train_loader))
             images = images.to(device)
             labels = labels.to(device)
             masks = masks.to(device)
