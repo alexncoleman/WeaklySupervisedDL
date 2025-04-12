@@ -69,7 +69,7 @@ class LocalNormalizedCutLoss(nn.Module):
         self.window_size = window_size
 
     def forward(self, preds, images):
-        if preds.dim() == 3:  # 如果是 3 维张量，添加批次维度
+        if preds.dim() == 3:
             preds = preds.unsqueeze(0)
             images = images.unsqueeze(0)
 
@@ -135,7 +135,7 @@ def train_fc_only(model, dataloader, device, epochs=10):
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += imgs.size(0)
-        # 打印每个 epoch 的损失和准确率
+        
         print(f"Epoch {epoch + 1}/{epochs} - Loss: {total_loss / total:.4f} - Acc: {100 * correct / total:.2f}%")
 
     model.eval()
@@ -184,7 +184,7 @@ def apply_dense_crf(img_np, cam_np):
     """
     Refines a CAM heatmap using DenseCRF
     """
-    img_np = np.ascontiguousarray(img_np)  # ✅ Fix non-contiguous array
+    img_np = np.ascontiguousarray(img_np)
 
     h, w = cam_np.shape
     d = dcrf.DenseCRF2D(w, h, 2)
@@ -345,22 +345,22 @@ class CAMGenerator:
 
             all_cams = []
             for class_idx in range(logits.shape[1]):
-                # 确保 class_idx 是标量
+                
                 if isinstance(class_idx, torch.Tensor):
                     class_idx = class_idx.item()
 
-                # 提取对应类别的权重
+                
                 weights = self.model.fc.weight[class_idx]  # (C_feat,)
 
-                # 确保 features 的形状正确
+                
                 assert features.shape[0] == weights.shape[0], \
                     f"Features channel size {features.shape[0]} does not match weights size {weights.shape[0]}"
 
-                # 计算 CAM
+                
                 cam = torch.einsum("c,chw->hw", weights, features)  # (H, W)
                 cam = F.relu(cam)
 
-                # 归一化 CAM
+                
                 cam -= cam.min()
                 cam /= cam.max() + 1e-8  # Normalize to [0,1]
                 all_cams.append(cam)
