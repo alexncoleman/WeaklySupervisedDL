@@ -68,7 +68,7 @@ for epoch in range(num_epochs):
     print(f"Starting epoch {epoch + 1}")
     model.train()
     running_loss = 0.0
-    for images, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+    for images, masks in train_loader:
         images, masks = images.to(device), masks.to(device)
         optimizer.zero_grad()
         outputs = model(images)['out']
@@ -88,7 +88,7 @@ def evaluate_model(model, data_loader, device, num_classes=2):
     iou_per_class = np.zeros(num_classes)
     class_counts = np.zeros(num_classes)
 
-    for images, masks in tqdm(data_loader, desc="Evaluating"):
+    for images, masks in data_loader:
         images, masks = images.to(device), masks.to(device)
         with torch.no_grad():
             outputs = model(images)['out']
