@@ -69,7 +69,7 @@ class LocalNormalizedCutLoss(nn.Module):
         self.window_size = window_size
 
     def forward(self, preds, images):
-        if preds.dim() == 3:
+        if preds.dim() == 3:  # 如果是 3 维张量，添加批次维度
             preds = preds.unsqueeze(0)
             images = images.unsqueeze(0)
 
@@ -135,7 +135,7 @@ def train_fc_only(model, dataloader, device, epochs=10):
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += imgs.size(0)
-        
+        # 打印每个 epoch 的损失和准确率
         print(f"Epoch {epoch + 1}/{epochs} - Loss: {total_loss / total:.4f} - Acc: {100 * correct / total:.2f}%")
 
     model.eval()
@@ -184,7 +184,7 @@ def apply_dense_crf(img_np, cam_np):
     """
     Refines a CAM heatmap using DenseCRF
     """
-    img_np = np.ascontiguousarray(img_np)
+    img_np = np.ascontiguousarray(img_np)  # ✅ Fix non-contiguous array
 
     h, w = cam_np.shape
     d = dcrf.DenseCRF2D(w, h, 2)
@@ -240,7 +240,7 @@ class LayerCAMGenerator:
         return hook
 
 
-    def generate(self, images, class_idx=None):
+    def generate(self, images, class_idx=None, alpha=1.0):
         self.activations.clear()
         self.gradients.clear()
 
@@ -271,6 +271,9 @@ class LayerCAMGenerator:
                 for i in range(cam.shape[0]):
                     c = cam[i]
                     c = c.detach()
+                    c -= c.min()
+                    c /= (c.max() + 1e-8)
+                    c = c ** alpha
                     c -= c.min()
                     c /= (c.max() + 1e-8)
                     cam[i] = c
@@ -345,22 +348,22 @@ class CAMGenerator:
 
             all_cams = []
             for class_idx in range(logits.shape[1]):
-                
+                # 确保 class_idx 是标量
                 if isinstance(class_idx, torch.Tensor):
                     class_idx = class_idx.item()
 
-                
+                # 提取对应类别的权重
                 weights = self.model.fc.weight[class_idx]  # (C_feat,)
 
-                
+                # 确保 features 的形状正确
                 assert features.shape[0] == weights.shape[0], \
                     f"Features channel size {features.shape[0]} does not match weights size {weights.shape[0]}"
 
-                
+                # 计算 CAM
                 cam = torch.einsum("c,chw->hw", weights, features)  # (H, W)
                 cam = F.relu(cam)
 
-                
+                # 归一化 CAM
                 cam -= cam.min()
                 cam /= cam.max() + 1e-8  # Normalize to [0,1]
                 all_cams.append(cam)
@@ -447,9 +450,9 @@ class PseudoSegmentationDataset(Dataset):
             image, mask = self.transform(image, mask)
 
         if not isinstance(mask, torch.Tensor):
-            mask = torch.as_tensor(np.array(mask), dtype=torch.long)
+            mask = torch.as_tensor(np.array(mask), dtype=torch.float)
         #print(f"Type of mask: {type(mask)}")
-        return image, mask
+        return image, mask, os.path.basename(img_path)
 
 def joint_transform(image, mask):
     image = TF.resize(image, (256, 256))
@@ -474,7 +477,7 @@ loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4, pin_mem
 
 classifier = FrozenResNetCAM().to(device)
 
-train_fc_only(classifier, loader, device, epochs=10)
+train_fc_only(classifier, loader, device, epochs=15)
 print(" Classifier trained.")
 
 save_dir = './saves'
@@ -488,16 +491,21 @@ print(f"✅Weights saved to {save_path}")
 classifier.load_state_dict(torch.load(save_path, map_location=torch.device('cuda'), weights_only=True))
 classifier.eval()
 
-loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-
 test_dataset = download_data("./data", split="test")
-test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
 
 from os import PRIO_PROCESS
-p = 0
 cam_gen = CAMGenerator(classifier)
 layercam_gen = LayerCAMGenerator(classifier, target_layer_names=["layer3", "layer4"])  # f2, f3, f4
 device = "cuda"
+
+save_dir = "./pseudo_masks"
+os.makedirs(save_dir, exist_ok=True)
+
+image_save_dir = "./images"
+os.makedirs(image_save_dir, exist_ok=True)
+
+img_id = 0
 
 for img, (label, true_mask) in test_loader:
     img = img[0].to(device)  # (3, H, W)
@@ -516,35 +524,28 @@ for img, (label, true_mask) in test_loader:
 
     ### --- LAYERCAM GENERATOR ---
     class_tensor = torch.tensor(valid_class_indices).to(device)
-    layercam_output = layercam_gen.generate(img, class_idx=class_tensor)  # (1, H, W)
-    cam_bg, regular_cam = cam_gen.generate_bg_cam(img, class_tensor)  # (1, H, W)
-    layercam_bg, _ = layercam_gen.generate_bg_cam(img, class_tensor, alpha=1.9)
+    layercam_output = layercam_gen.generate(img, class_idx=class_tensor, alpha=0.5)  # (1, H, W)
 
     layercam = layercam_output.squeeze(0)  # (H, W)
-    layercam[layercam < 0.3] = 0.0
+    layercam[layercam < 0.2] = 0.0
 
-    layercam_bg[layercam_bg < 0.5] = 0.0
-
-    cam_bg[cam_bg <0.3] = 0.0
+    cam_bg = layercam
 
     # Build prediction masks
     pred_fg_mask = torch.zeros_like(cam_bg).long()
     pred_fg_mask[cam_bg > 0.0] = 1
 
-    pred_bg_mask = torch.zeros_like(layercam_bg).long()
-    pred_bg_mask[layercam_bg > 0.0] = 1
 
     # # Resize if needed
     if pred_fg_mask.shape != true_mask.shape:
         pred_fg_mask = F.interpolate(pred_fg_mask.unsqueeze(0).unsqueeze(0).float(), size=true_mask.shape[-2:], mode='nearest').squeeze().long()
-        pred_bg_mask = F.interpolate(pred_bg_mask.unsqueeze(0).unsqueeze(0).float(), size=true_mask.shape[-2:], mode='nearest').squeeze().long()
+        # pred_bg_mask = F.interpolate(pred_bg_mask.unsqueeze(0).unsqueeze(0).float(), size=true_mask.shape[-2:], mode='nearest').squeeze().long()
 
     iou_fg, acc_fg = compute_iou_and_acc(pred_fg_mask, true_mask)
-    iou_bg, acc_bg = compute_iou_and_acc(pred_bg_mask, true_mask)
+    # iou_bg, acc_bg = compute_iou_and_acc(pred_bg_mask, true_mask)
 
     # Visualize overlays
     cam_overlay = overlay_cam_on_image(img, cam_bg, alpha=0.65, colormap='jet')
-    layercam_bg_overlay = overlay_cam_on_image(img, layercam_bg, alpha=0.5, colormap='jet')
 
     # Convert image to uint8 for OpenCV (if not normalized)
     image_np = img.detach().cpu().permute(1, 2, 0).numpy()
@@ -554,8 +555,16 @@ for img, (label, true_mask) in test_loader:
     image_np = (image_np * 255).astype(np.uint8).clip(0, 255)
     image_np = np.ascontiguousarray(image_np)
 
-    refined_mask = apply_dense_crf(image_np, layercam_bg.squeeze().cpu().numpy())
-    refined_mask = keep_largest(refined_mask)
+    refined_mask = apply_dense_crf(image_np, cam_bg.squeeze().cpu().numpy())
+    # refined_mask = keep_largest(refined_mask)
+
+    mask_path = os.path.join(save_dir, f"{img_id}.png")
+    save_image(torch.from_numpy(refined_mask).float().unsqueeze(0), mask_path)
+
+    # Save input image (unnormalized)
+    img_orig = img.cpu().clone()
+    img_orig = (img_orig - img_orig.min()) / (img_orig.max() - img_orig.min())
+    save_image(img_orig, os.path.join(image_save_dir, f"{img_id}.png"))
 
     # Plots
     """
@@ -591,53 +600,9 @@ for img, (label, true_mask) in test_loader:
     plt.tight_layout()
     plt.show()
     """
-    if p == 5:
-        break
-    p += 1
-
-save_dir = "./pseudo_masks"
-os.makedirs(save_dir, exist_ok=True)
-
-image_save_dir = "./images"
-os.makedirs(image_save_dir, exist_ok=True)
-
-img_id = 0
-layer_cam = LayerCAMGenerator(classifier, target_layer_names=["layer3", "layer4"])  # f2, f3, f4
-for img, (label, true_mask) in loader:
-    img = img[0].to(device)
-    label = label[0].item() if isinstance(label[0], torch.Tensor) else label[0]
-    class_tensor = torch.tensor([label]).to(device)
-
-    cam_bg, _ = layer_cam.generate_bg_cam(img, class_tensor, alpha=1.9)
-    cam_bg[cam_bg < 0.5] = 0.0
-
-    pred_mask = torch.zeros_like(cam_bg).long()
-    pred_mask[cam_bg > 0.0] = 1
-
-    # Convert image to uint8 for OpenCV (if not normalized)
-    image_np = img.detach().cpu().permute(1, 2, 0).numpy()
-    image_np = (image_np * 255).astype(np.uint8).clip(0, 255)
-
-    image_np = img.detach().cpu().permute(1, 2, 0).numpy()
-    image_np = (image_np * 255).astype(np.uint8).clip(0, 255)
-    image_np = np.ascontiguousarray(image_np)
-
-    refined_mask = apply_dense_crf(image_np, cam_bg.squeeze().cpu().numpy())
-
-    # Save pseudo mask
-    mask_path = os.path.join(save_dir, f"{img_id}.png")
-    save_image(torch.from_numpy(refined_mask).float().unsqueeze(0), mask_path)
-
-    # Save input image (unnormalized)
-    img_orig = img.cpu().clone()
-    img_orig = (img_orig - img_orig.min()) / (img_orig.max() - img_orig.min())
-    save_image(img_orig, os.path.join(image_save_dir, f"{img_id}.png"))
-
     img_id += 1
     if img_id >= 200:  # Save only 200 samples
         break
-
-#del model
 
 """### Regularisation Loss: Boundaries
 
@@ -694,6 +659,7 @@ def evaluate_model(model, test_loader):
             true_mask = true_mask.clone()
             true_mask[true_mask == 2] = 1
             true_mask[true_mask == 0] = 0
+            true_mask = 1- true_mask
 
             # Get model prediction
             with torch.no_grad():
@@ -715,28 +681,22 @@ def evaluate_model(model, test_loader):
         #print(f"Segmentation Model: IoU: {average_iou:.3f} | Accuracy: {average_acc:.3f}")
     return average_iou, average_acc
 
-def train_model(num_epochs = 3):
+def train_model(model, optimizer, criterion_ce, num_epochs = 3):
     # Define model
-    num_classes = 2
-    model = torchvision.models.segmentation.deeplabv3_resnet50(pretrained=True)
-    model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-    model = model.cuda()
 
     # Define losses
-    criterion_ce = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    model.train()
 
     for epoch in range(num_epochs):
-        model.train()
         total_loss = 0.0
-        for images, masks in train_loader:
+        for images, masks, _ in train_loader:
             images, masks = images.cuda(), masks.cuda()
             masks = torch.clamp(masks, max=1)  # Ensure binary labels
 
             outputs = model(images)['out']  # (B, C, H, W)
 
-            loss = criterion_ce(outputs, masks.long())
+            loss = criterion_ce(outputs, masks)
 
             optimizer.zero_grad()
             loss.backward()
@@ -745,9 +705,8 @@ def train_model(num_epochs = 3):
             total_loss += loss.item()
 
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss:.4f}")
-    return model
 
-def refine_pseudo_mask(model, image, mask, lambda_boundary=0.1, threshold=0.5, lr=1e-4, num_steps=1,
+def refine_pseudo_mask(model, image, mask, lambda_boundary=0.1, threshold=0.5, lr=1e-2, num_steps=20,
                        sigma_color=0.1, window_size=5):
     # Ensure the image is on the same device as the model.
     device = next(model.parameters()).device
@@ -773,6 +732,7 @@ def refine_pseudo_mask(model, image, mask, lambda_boundary=0.1, threshold=0.5, l
     criterion_boundary = LocalNormalizedCutLoss(sigma_color=sigma_color, window_size=window_size)
 
     # Optimize X over a fixed number of steps.
+    total_loss = 0.0
     for step in range(num_steps):
         optimizer_X.zero_grad()
         # Project X to probability simplex
@@ -794,7 +754,9 @@ def refine_pseudo_mask(model, image, mask, lambda_boundary=0.1, threshold=0.5, l
 
         loss.backward()
         optimizer_X.step()
+        total_loss += loss.item()
 
+    # print(f"refine loss: {total_loss:.4f}")
     # After refinement, compute the final soft distribution.
     X_final = F.softmax(X, dim=1)
 
@@ -820,16 +782,17 @@ train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
 
 # Define model
 num_classes = 2
-model = torchvision.models.segmentation.deeplabv3_resnet50(pretrained=True)
-model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
-model = model.cuda()
-model.eval()
+net = torchvision.models.segmentation.deeplabv3_resnet50(pretrained=True)
+net.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
+net = net.cuda()
+optimizer = torch.optim.Adam(net.parameters(), lr=1e-4)
+criterion_ce = nn.CrossEntropyLoss()
 
-for iteration in range(5):
+for iteration in range(10):
     # --- Step 1: Train the model on current pseudo masks ---
-    model = train_model()
+    train_model(net, optimizer, criterion_ce, num_epochs = 10)
     # Optionally, evaluate on a validation set to monitor improvement
-    avg_iou, avg_acc = evaluate_model(model, test_loader)
+    avg_iou, avg_acc = evaluate_model(net, test_loader)
     print(f"Iteration {iteration+1}: Evaluation -> Mean IoU: {avg_iou:.4f}, Mean Acc: {avg_acc:.4f}")
 
     # --- Step 2: Update (Refine) the pseudo masks ---
@@ -837,13 +800,14 @@ for iteration in range(5):
     new_mask_paths = []
     #for idx, (img, mask) in enumerate(dataset):
     #    print(f"Type of mask: {type(mask)}")
-    for idx, (img, mask) in enumerate(train_dataset):
-        # img has shape (C, H, W); ensure it is on the proper device
-        refined_mask = refine_pseudo_mask(model, img, mask, threshold=0.5, num_steps = 2, lambda_boundary=0.5)
-        # Save the refined pseudo mask (overwrite the previous one)
-        mask_path = os.path.join(save_dir, f"{idx}.png")
-        save_image(refined_mask.unsqueeze(0).float(), mask_path)
-        new_mask_paths.append(mask_path)
+    for repeated in range(5):
+        for idx, (img, mask, img_name) in enumerate(train_dataset):
+            # img has shape (C, H, W); ensure it is on the proper device
+            refined_mask = refine_pseudo_mask(net, img, mask, threshold=0.3, lr=1e-4, num_steps = 10, lambda_boundary=0.1)
+            # Save the refined pseudo mask (overwrite the previous one)
+            mask_path = os.path.join(save_dir, img_name)
+            save_image(refined_mask.unsqueeze(0).float(), mask_path)
+            new_mask_paths.append(mask_path)
 
     # Option 2: If your dataset caches the masks, you might need to reinitialize your dataset.
     train_dataset = PseudoSegmentationDataset(
@@ -859,7 +823,7 @@ print("Alternating training and pseudo mask updates completed.")
 from torchvision import transforms
 import matplotlib.pyplot as plt
 
-model.eval()
+net.eval()
 
 inference_transform = transforms.Compose([
     transforms.Resize((256, 256)),
@@ -874,7 +838,7 @@ def infer_and_plot(img_path, pseudo_mask_path):
     input_tensor = inference_transform(img).unsqueeze(0).cuda()
 
     with torch.no_grad():
-        output = model(input_tensor)['out']
+        output = net(input_tensor)['out']
         pred = torch.argmax(output.squeeze(), dim=0).cpu().numpy()
     """
     plt.figure(figsize=(10, 4))
