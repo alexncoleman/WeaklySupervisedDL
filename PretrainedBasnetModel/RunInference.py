@@ -7,7 +7,7 @@ from model import BASNet
 import numpy as np
 
 # Paths
-model_path = '../Weights/basnet.pth'
+model_path = './Weights/basnet.pth'
 dataset_root = './OxfordIIITPetDataset/oxford-iiit-pet'
 image_folder = os.path.join(dataset_root, 'images')
 trimap_folder = os.path.join(dataset_root, 'annotations', 'trimaps')
