@@ -109,6 +109,27 @@ def initialize_model():
     model.classifier[4] = nn.Conv2d(256, num_classes, kernel_size=1)
     return model.cuda()
 
+def train_model(model, optimizer, num_epochs = 3):
+    model.train()
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        for images, masks, _ in train_loader:
+            images, masks = images.cuda(), masks.cuda()
+            masks = torch.clamp(masks, max=1)  # Ensure binary labels
+
+            outputs = model(images)['out']  # (B, C, H, W)
+
+            loss = nn.CrossEntropyLoss(outputs, masks)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss:.4f}")
+
 def train_and_refine(model, dataset, mask_dir, lambda_boundary, momentum, sigma_color, sigma_space, epochs, visualize_idx, iteration):
     # Train model on current pseudo masks
     model.train()
